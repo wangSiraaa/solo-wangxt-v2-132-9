@@ -10,6 +10,16 @@ use range_cache_proxy::ProxyConfig;
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 
+/// Common surface every test environment exposes to the shared stats
+/// helpers.
+pub trait TestEnv {
+    fn http_client(&self) -> &reqwest::Client;
+    /// Base URL WITHOUT trailing slash (e.g. http://127.0.0.1:41234).
+    fn upstream_base_no_slash(&self) -> &str;
+}
+
+/// Standard integration-test environment (used by the range_cache suite).
+#[allow(dead_code)]
 pub struct Env {
     pub client: reqwest::Client,
     pub proxy: String,
@@ -21,6 +31,16 @@ pub struct Env {
     pub cache_dir: TempDir,
 }
 
+impl TestEnv for Env {
+    fn http_client(&self) -> &reqwest::Client {
+        &self.client
+    }
+    fn upstream_base_no_slash(&self) -> &str {
+        &self.upstream
+    }
+}
+
+#[allow(dead_code)]
 pub async fn spawn_env() -> Env {
     let upstream_base = support::spawn().await; // ends with '/'
     let upstream = upstream_base.trim_end_matches('/').to_string();
@@ -57,10 +77,13 @@ pub fn sha256_hex(b: &[u8]) -> String {
 }
 
 /// One stats line for an object, as a map of metric -> u64.
-pub async fn stats_for(env: &Env, name: &str) -> std::collections::HashMap<String, u64> {
+pub async fn stats_for(
+    env: &dyn TestEnv,
+    name: &str,
+) -> std::collections::HashMap<String, u64> {
     let txt = env
-        .client
-        .get(format!("{upstream}/stats", upstream = env.upstream))
+        .http_client()
+        .get(format!("{upstream}/stats", upstream = env.upstream_base_no_slash()))
         .send()
         .await
         .unwrap()
@@ -75,9 +98,12 @@ pub async fn stats_for(env: &Env, name: &str) -> std::collections::HashMap<Strin
     std::collections::HashMap::new()
 }
 
-pub async fn reset_stats(env: &Env) {
-    env.client
-        .get(format!("{upstream}/stats/reset", upstream = env.upstream))
+pub async fn reset_stats(env: &dyn TestEnv) {
+    env.http_client()
+        .get(format!(
+            "{upstream}/stats/reset",
+            upstream = env.upstream_base_no_slash()
+        ))
         .send()
         .await
         .unwrap();

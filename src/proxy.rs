@@ -40,17 +40,17 @@ use crate::etag::ETag;
 use crate::range::{self, RangeSpec};
 use crate::store::{BlobStore, Spool};
 
-const MAX_PLAN_ITERATIONS: u32 = 4;
+pub(crate) const MAX_PLAN_ITERATIONS: u32 = 4;
 /// How many times a damaged blob (file shorter than metadata) may be reset
 /// and re-fetched within one request.
 const MAX_CACHE_REPAIRS: u32 = 2;
 
 pub struct ProxyState {
     pub config: ProxyConfig,
-    base_url: url::Url,
-    db: Arc<Mutex<Connection>>,
+    pub(crate) base_url: url::Url,
+    pub(crate) db: Arc<Mutex<Connection>>,
     pub store: BlobStore,
-    http: reqwest::Client,
+    pub(crate) http: reqwest::Client,
     locks: tokio::sync::Mutex<HashMap<String, Arc<Mutex<()>>>>,
 }
 
@@ -79,6 +79,15 @@ async fn proxy_entry(
 /// Build the proxy app. Fails when the configured upstream is not an
 /// http(s) loopback origin.
 pub async fn build_app(config: ProxyConfig) -> anyhow::Result<(axum::Router, Arc<ProxyState>)> {
+    let state = build_state(config).await?;
+    let app: axum::Router = inner_router(state.clone());
+    Ok((app, state))
+}
+
+/// Open (or create) the cache and construct the shared proxy state. Shared
+/// with the offline prewarm driver so both go through exactly one set of
+/// allow-list, validator and commit rules.
+pub async fn build_state(config: ProxyConfig) -> anyhow::Result<Arc<ProxyState>> {
     let base_url = url::Url::parse(&config.upstream_base)?;
     if !matches!(base_url.scheme(), "http" | "https") {
         anyhow::bail!("upstream must be http(s): {}", config.upstream_base);
@@ -103,19 +112,17 @@ pub async fn build_app(config: ProxyConfig) -> anyhow::Result<(axum::Router, Arc
         .connect_timeout(std::time::Duration::from_secs(5))
         .build()?;
 
-    let state = Arc::new(ProxyState {
+    Ok(Arc::new(ProxyState {
         config,
         base_url,
         db: Arc::new(Mutex::new(conn)),
         store,
         http,
         locks: tokio::sync::Mutex::new(HashMap::new()),
-    });
-    let app: axum::Router = inner_router(state.clone());
-    Ok((app, state))
+    }))
 }
 
-async fn lock_for(state: &Arc<ProxyState>, key: &str) -> Arc<Mutex<()>> {
+pub(crate) async fn lock_for(state: &Arc<ProxyState>, key: &str) -> Arc<Mutex<()>> {
     let mut map = state.locks.lock().await;
     map.entry(key.to_string())
         .or_insert_with(|| Arc::new(Mutex::new(())))
@@ -127,7 +134,7 @@ async fn lock_for(state: &Arc<ProxyState>, key: &str) -> Arc<Mutex<()>> {
 // ---------------------------------------------------------------------------
 
 /// Reconstruct the single allowed upstream target URL from the request URI.
-fn resolve_target(state: &ProxyState, uri: &Uri) -> Result<url::Url> {
+pub(crate) fn resolve_target(state: &ProxyState, uri: &Uri) -> Result<url::Url> {
     let raw_path = uri.path();
     if !raw_path.starts_with('/') {
         return Err(ProxyError::PathEscape);
@@ -170,7 +177,7 @@ fn resolve_target(state: &ProxyState, uri: &Uri) -> Result<url::Url> {
     Ok(target)
 }
 
-fn target_key(target: &url::Url) -> String {
+pub(crate) fn target_key(target: &url::Url) -> String {
     match target.query() {
         Some(q) => format!("{}?{q}", target.path()),
         None => target.path().to_string(),
@@ -181,19 +188,19 @@ fn target_key(target: &url::Url) -> String {
 // Upstream capture
 // ---------------------------------------------------------------------------
 
-struct Captured {
-    spool: Spool,
-    len: u64,
-    etag: Option<ETag>,
-    last_modified: Option<i64>,
-    content_type: Option<String>,
-    content_range: Option<String>,
+pub(crate) struct Captured {
+    pub(crate) spool: Spool,
+    pub(crate) len: u64,
+    pub(crate) etag: Option<ETag>,
+    pub(crate) last_modified: Option<i64>,
+    pub(crate) content_type: Option<String>,
+    pub(crate) content_range: Option<String>,
 }
 
 /// Run one upstream request, spooling the body into a temp file.
 /// Content-Length is checked strictly: a body that ends early is a
 /// truncation error, never a successful capture.
-async fn capture_upstream(
+pub(crate) async fn capture_upstream(
     state: &ProxyState,
     target: &url::Url,
     range: Option<&str>,
@@ -267,16 +274,33 @@ async fn capture_upstream(
     let mut spool = state.store.new_spool().await?;
     let mut len = 0u64;
     let mut stream = resp.bytes_stream();
+    let mut stream_err: Option<reqwest::Error> = None;
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk?;
-        spool.write_all(&chunk).await?;
-        len += chunk.len() as u64;
+        match chunk {
+            Ok(chunk) => {
+                spool.write_all(&chunk).await?;
+                len += chunk.len() as u64;
+            }
+            Err(e) => {
+                stream_err = Some(e);
+                break;
+            }
+        }
     }
     spool.flush().await?;
+    // A body that ended (cleanly or with an I/O error) before the declared
+    // length is truncation — never a successful capture. Report the bytes
+    // actually received.
     if let Some(want) = declared {
         if want != len {
-            return Err(ProxyError::TruncatedUpstream);
+            return Err(ProxyError::TruncatedBody {
+                received: len,
+                expected: want,
+            });
         }
+    }
+    if let Some(e) = stream_err {
+        return Err(ProxyError::Upstream(e));
     }
 
     Ok((
@@ -427,7 +451,7 @@ async fn serve(
                 .await?
                 {
                     ColdOutcome::Reply(resp) => return Ok(resp),
-                    ColdOutcome::Replan => continue,
+                    ColdOutcome::Replan { .. } => continue,
                 }
             }
         };
@@ -562,15 +586,14 @@ async fn serve(
 }
 
 /// Result of validating a cached version against the upstream.
-enum Revalidation {
+pub(crate) enum Revalidation {
     /// Upstream confirmed the strong validator (304).
     Fresh,
     /// A new strong full representation was committed.
-    #[allow(dead_code)]
     Changed(VersionRow),
 }
 
-async fn revalidate_cached(
+pub(crate) async fn revalidate_cached(
     state: &ProxyState,
     target: &url::Url,
     key: &str,
@@ -620,7 +643,10 @@ async fn revalidate_cached(
     spool.flush().await?;
     if let Some(want) = declared {
         if want != len {
-            return Err(ProxyError::TruncatedUpstream);
+            return Err(ProxyError::TruncatedBody {
+                received: len,
+                expected: want,
+            });
         }
     }
 
@@ -722,14 +748,18 @@ async fn unsatisfiable(
     }
 }
 
-enum ColdOutcome {
+pub(crate) enum ColdOutcome {
     Reply(Response),
-    /// A strong 206 established a version; the caller re-plans.
-    Replan,
+    /// A strong 206 established a version; the caller re-plans. `fetched`
+    /// is the number of body bytes the cold response actually carried.
+    Replan {
+        version: VersionRow,
+        fetched: u64,
+    },
 }
 
 /// No known length yet: forward the client's Range verbatim.
-async fn cold_range(
+pub(crate) async fn cold_range(
     state: &ProxyState,
     target: &url::Url,
     key: &str,
@@ -751,8 +781,12 @@ async fn cold_range(
             }
         })),
         reqwest::StatusCode::PARTIAL_CONTENT => {
+            let fetched = cap.len;
             match store_proven_206(state, key, None, cap, None, None).await? {
-                ProveOutcome::Stored(_) => Ok(ColdOutcome::Replan),
+                ProveOutcome::Stored(v) => Ok(ColdOutcome::Replan {
+                    version: v,
+                    fetched,
+                }),
                 ProveOutcome::Passthrough(cap) => {
                     // Weak/no validator, bad Content-Range or multipart:
                     // pass through, never merge into the cache.
@@ -814,7 +848,7 @@ async fn full_get(state: &ProxyState, target: &url::Url) -> Result<Response> {
     }
 }
 
-enum CommitOutcome {
+pub(crate) enum CommitOutcome {
     Strong(VersionRow),
     /// Validator weak/absent: capture handed back for uncached passthrough.
     Uncached(Captured),
@@ -825,7 +859,7 @@ enum CommitOutcome {
 /// Equal length is never treated as equal content: a new strong ETag gets a
 /// distinct version row and its blob is physically replaced with the
 /// freshly verified capture.
-async fn commit_200(
+pub(crate) async fn commit_200(
     state: &ProxyState,
     key: &str,
     cap: Captured,
@@ -857,7 +891,7 @@ async fn commit_200(
     Ok(CommitOutcome::Strong(v))
 }
 
-enum ProveOutcome {
+pub(crate) enum ProveOutcome {
     #[allow(dead_code)]
     Stored(VersionRow),
     /// Cannot prove: weak/no ETag, malformed Content-Range or multipart.
@@ -874,7 +908,7 @@ enum ProveOutcome {
 ///
 /// Bytes are written to the version's own blob *before* the segment row is
 /// committed.
-async fn store_proven_206(
+pub(crate) async fn store_proven_206(
     state: &ProxyState,
     key: &str,
     expected: Option<&VersionRow>,
@@ -949,7 +983,7 @@ async fn store_proven_206(
 // SQLite helpers
 // ---------------------------------------------------------------------------
 
-async fn with_db<T, F>(state: &ProxyState, f: F) -> Result<T>
+pub(crate) async fn with_db<T, F>(state: &ProxyState, f: F) -> Result<T>
 where
     T: Send + 'static,
     F: FnOnce(&Connection) -> rusqlite::Result<T> + Send + 'static,
@@ -964,7 +998,7 @@ where
     .map_err(ProxyError::Db)
 }
 
-async fn with_db_mut<T, F>(state: &ProxyState, f: F) -> Result<T>
+pub(crate) async fn with_db_mut<T, F>(state: &ProxyState, f: F) -> Result<T>
 where
     T: Send + 'static,
     F: FnOnce(&mut Connection) -> rusqlite::Result<T> + Send + 'static,

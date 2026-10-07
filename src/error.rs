@@ -8,6 +8,17 @@ pub enum ProxyError {
     Upstream(#[from] reqwest::Error),
     #[error("upstream refused to serve bytes (truncated or malformed)")]
     TruncatedUpstream,
+    /// Upstream announced `expected` bytes but the body closed after
+    /// `received`. The captured bytes are never committed.
+    #[error("upstream body truncated: received {received} of {expected} bytes")]
+    TruncatedBody { received: u64, expected: u64 },
+    /// Upstream evidence could not prove a cache version: a strong validator
+    /// was missing/weak, or a 206 contradicted its claimed interval.
+    #[error("upstream bytes cannot be proven by a strong validator")]
+    Unprovable,
+    /// Upstream reported the requested interval unsatisfiable (416).
+    #[error("upstream reports the range is unsatisfiable")]
+    UnsatisfiableRange,
     /// A cached blob file was shorter than the SQLite segments claimed.
     #[error("cached blob was truncated on disk")]
     BlobTruncated,
@@ -30,6 +41,9 @@ impl ProxyError {
             // Content-Range that contradicts its length, ...). Never turn
             // that into a successful complete response.
             ProxyError::TruncatedUpstream
+            | ProxyError::TruncatedBody { .. }
+            | ProxyError::Unprovable
+            | ProxyError::UnsatisfiableRange
             | ProxyError::BlobTruncated
             | ProxyError::Upstream(_) => StatusCode::BAD_GATEWAY,
             ProxyError::UpstreamNotAllowed | ProxyError::PathEscape => StatusCode::FORBIDDEN,

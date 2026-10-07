@@ -9,6 +9,7 @@ pub mod db;
 pub mod error;
 pub mod etag;
 pub mod httpdate;
+pub mod prewarm;
 pub mod proxy;
 pub mod range;
 pub mod store;
@@ -17,4 +18,4 @@ pub mod store;
 pub mod support;
 
 pub use config::ProxyConfig;
-pub use proxy::{build_app, ProxyState};
+pub use proxy::{build_app, build_state, ProxyState};

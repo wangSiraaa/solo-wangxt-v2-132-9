@@ -191,7 +191,9 @@ impl Spool {
     }
 
     /// Copy the captured bytes into `dst` at absolute offset `start`,
-    /// returning the number of bytes written. The spool is consumed.
+    /// returning the number of bytes written. The spool file is removed on
+    /// success (unlike `persist_rename`, the source still exists after a
+    /// copy, so it must not be left behind in `tmp/`).
     pub async fn copy_into_blob(self, dst: &Path, start: u64) -> std::io::Result<u64> {
         let mut this = self;
         let f = this.file.take().unwrap();
@@ -202,23 +204,27 @@ impl Spool {
         let dst = dst.to_path_buf();
         tokio::task::spawn_blocking(move || -> std::io::Result<()> {
             use std::io::{Read, Seek, Write};
-            let mut src = std::fs::File::open(&src)?;
-            src.seek(std::io::SeekFrom::Start(0))?;
-            let mut dst = std::fs::OpenOptions::new()
+            let mut srcf = std::fs::File::open(&src)?;
+            srcf.seek(std::io::SeekFrom::Start(0))?;
+            let mut dstf = std::fs::OpenOptions::new()
                 .create(true)
                 .truncate(false)
                 .write(true)
                 .open(&dst)?;
-            dst.seek(std::io::SeekFrom::Start(start))?;
+            dstf.seek(std::io::SeekFrom::Start(start))?;
             let mut chunk = vec![0u8; 64 * 1024];
             loop {
-                let n = src.read(&mut chunk)?;
+                let n = srcf.read(&mut chunk)?;
                 if n == 0 {
                     break;
                 }
-                dst.write_all(&chunk[..n])?;
+                dstf.write_all(&chunk[..n])?;
             }
-            dst.sync_all()?;
+            dstf.sync_all()?;
+            drop(srcf);
+            drop(dstf);
+            // Blob bytes are durable; the temp spool has no further use.
+            std::fs::remove_file(&src)?;
             Ok(())
         })
         .await
