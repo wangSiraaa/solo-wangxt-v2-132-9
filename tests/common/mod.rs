@@ -19,6 +19,7 @@ pub struct Env {
     upstream_base: String,
     #[allow(dead_code)]
     pub cache_dir: TempDir,
+    pub state: std::sync::Arc<range_cache_proxy::ProxyState>,
 }
 
 pub async fn spawn_env() -> Env {
@@ -26,7 +27,7 @@ pub async fn spawn_env() -> Env {
     let upstream = upstream_base.trim_end_matches('/').to_string();
     let cache_dir = TempDir::new().unwrap();
     let config = ProxyConfig::new(upstream_base.clone(), cache_dir.path().to_path_buf());
-    let (app, _) = range_cache_proxy::build_app(config).await.unwrap();
+    let (app, state) = range_cache_proxy::build_app(config).await.unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr: SocketAddr = listener.local_addr().unwrap();
     tokio::spawn(async move {
@@ -42,6 +43,7 @@ pub async fn spawn_env() -> Env {
         upstream,
         upstream_base,
         cache_dir,
+        state,
     }
 }
 

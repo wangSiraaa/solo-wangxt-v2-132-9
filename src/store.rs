@@ -75,6 +75,22 @@ impl BlobStore {
         })
     }
 
+    /// Read and discard a verified slice `[start, end)` of a version blob.
+    /// Returns the number of bytes that were successfully checked.
+    pub async fn verify_range(
+        &self,
+        version_id: i64,
+        start: u64,
+        end: u64,
+    ) -> Result<u64> {
+        let bytes = self
+            .open_range(version_id, start, end)
+            .await?
+            .read_all_checked()
+            .await?;
+        Ok(bytes.len() as u64)
+    }
+
     pub(crate) async fn new_spool(&self) -> Result<Spool> {
         let n = self.counter.fetch_add(1, Ordering::Relaxed);
         let name = format!(

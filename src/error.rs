@@ -6,8 +6,16 @@ use axum::http::StatusCode;
 pub enum ProxyError {
     #[error("upstream I/O failure: {0}")]
     Upstream(#[from] reqwest::Error),
+    #[error("upstream I/O failure after {received} bytes: {source}")]
+    UpstreamRead {
+        #[source]
+        source: reqwest::Error,
+        received: u64,
+    },
     #[error("upstream refused to serve bytes (truncated or malformed)")]
     TruncatedUpstream,
+    #[error("upstream truncated body: expected {expected} bytes, received {received}")]
+    TruncatedUpstreamCapture { expected: u64, received: u64 },
     /// A cached blob file was shorter than the SQLite segments claimed.
     #[error("cached blob was truncated on disk")]
     BlobTruncated,
@@ -30,6 +38,8 @@ impl ProxyError {
             // Content-Range that contradicts its length, ...). Never turn
             // that into a successful complete response.
             ProxyError::TruncatedUpstream
+            | ProxyError::TruncatedUpstreamCapture { .. }
+            | ProxyError::UpstreamRead { .. }
             | ProxyError::BlobTruncated
             | ProxyError::Upstream(_) => StatusCode::BAD_GATEWAY,
             ProxyError::UpstreamNotAllowed | ProxyError::PathEscape => StatusCode::FORBIDDEN,

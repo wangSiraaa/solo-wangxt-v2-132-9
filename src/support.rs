@@ -6,7 +6,7 @@
 //!   /obj/weak           strong bytes but a W/ ETag
 //!   /obj/noetag         200 always, no ETag (pass-through without caching)
 //!   /obj/slow           streamed slowly (client disconnect tests)
-//!   /obj/truncated      Content-Length lies; the body ends early
+//!   /obj/truncated      Content-Length lies; the body (200 or 206) ends early
 //!   /obj/ignores-range  always answers 200 even when Range is sent
 //!   /obj/mutable        fixed-length body whose content/ETag change via POST
 //!   /redir              302 to an EXTERNAL url (allow-list/no-redirect test)
@@ -415,12 +415,50 @@ fn slow_stream(data: Vec<u8>, delay_ms: u64) -> Body {
     Body::from_stream(s)
 }
 
-/// Announces 50 000 bytes but only sends 10 000 before closing.
-async fn get_truncated(State(st): State<UpState>) -> Response {
+/// Announces 50 000 bytes but only sends 10 000 before closing. Range
+/// requests likewise announce the requested interval but stop after 500
+/// bytes, exercising partial-response truncation during warming.
+async fn get_truncated(
+    State(st): State<UpState>,
+    headers: HeaderMap,
+) -> Response {
     const ADVERTISE: usize = 50_000;
     const ACTUAL: usize = 10_000;
+    const RANGE_ACTUAL: usize = 500;
+    bump(&st.stats, "truncated", |s| s.requests += 1);
+    let range = headers
+        .get(axum::http::header::RANGE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(crate::range::parse_range);
+    if let Some(crate::range::RangeSpec::Single(iv)) = range {
+        if let Ok((s, e)) = crate::range::resolve(iv, ADVERTISE as u64) {
+            bump(&st.stats, "truncated", |x| {
+                x.partial_206 += 1;
+                x.bytes_sent += RANGE_ACTUAL as u64;
+            });
+            let data = object_bytes("truncated-v1", RANGE_ACTUAL);
+            let mut resp = Response::new(Body::from(data));
+            *resp.status_mut() = StatusCode::PARTIAL_CONTENT;
+            let h = resp.headers_mut();
+            h.insert(
+                axum::http::header::CONTENT_TYPE,
+                HeaderValue::from_static("application/octet-stream"),
+            );
+            h.insert(axum::http::header::ETAG, etag_value("truncated-v1", false));
+            h.insert(
+                axum::http::header::CONTENT_RANGE,
+                HeaderValue::from_str(&crate::range::content_range(s, e, ADVERTISE as u64))
+                    .unwrap(),
+            );
+            h.insert(
+                axum::http::header::CONTENT_LENGTH,
+                HeaderValue::from_str(&(e + 1 - s).to_string()).unwrap(),
+            );
+            return resp;
+        }
+    }
+
     bump(&st.stats, "truncated", |s| {
-        s.requests += 1;
         s.full_200 += 1;
         s.bytes_sent += ACTUAL as u64;
     });

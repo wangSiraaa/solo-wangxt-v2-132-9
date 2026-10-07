@@ -45,6 +45,13 @@ const MAX_PLAN_ITERATIONS: u32 = 4;
 /// and re-fetched within one request.
 const MAX_CACHE_REPAIRS: u32 = 2;
 
+#[path = "proxy_warmup.rs"]
+mod warmup;
+
+pub use warmup::{
+    parse_warmup_manifest, warm_entries, WarmEntry, WarmItemResult, WarmStatus, WarmSummary,
+};
+
 pub struct ProxyState {
     pub config: ProxyConfig,
     base_url: url::Url,
@@ -268,14 +275,17 @@ async fn capture_upstream(
     let mut len = 0u64;
     let mut stream = resp.bytes_stream();
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk?;
+        let chunk = chunk.map_err(|source| ProxyError::UpstreamRead { source, received: len })?;
         spool.write_all(&chunk).await?;
         len += chunk.len() as u64;
     }
     spool.flush().await?;
     if let Some(want) = declared {
         if want != len {
-            return Err(ProxyError::TruncatedUpstream);
+            return Err(ProxyError::TruncatedUpstreamCapture {
+                expected: want,
+                received: len,
+            });
         }
     }
 
@@ -407,6 +417,7 @@ async fn serve(
     };
 
     let mut repairs = 0;
+    let mut fetched_during_request = false;
     for _ in 0..MAX_PLAN_ITERATIONS {
         let key_for_db = key.clone();
         let latest = with_db(&state, move |c| {
@@ -426,8 +437,11 @@ async fn serve(
                 )
                 .await?
                 {
-                    ColdOutcome::Reply(resp) => return Ok(resp),
-                    ColdOutcome::Replan => continue,
+                    ColdOutcome::Reply(resp, _, _) => return Ok(resp),
+                    ColdOutcome::Replan(_) => {
+                        fetched_during_request = true;
+                        continue;
+                    }
                 }
             }
         };
@@ -527,15 +541,17 @@ async fn serve(
                     body,
                 ));
             }
-        } else {
+            fetched_during_request = true;
+        } else if !fetched_during_request {
             // The whole requested interval is on disk. Disk alone is not
             // proof: two representations may have identical lengths, so
             // confirm the cached version is still current with a strong
             // conditional request before returning any cached bytes.
             match revalidate_cached(&state, &target, &key, &ver).await? {
                 Revalidation::Fresh => {}
-                Revalidation::Changed(_) => {
+                Revalidation::Changed(_, _) => {
                     // New representation committed; re-plan against it.
+                    fetched_during_request = true;
                     continue;
                 }
             }
@@ -567,7 +583,7 @@ enum Revalidation {
     Fresh,
     /// A new strong full representation was committed.
     #[allow(dead_code)]
-    Changed(VersionRow),
+    Changed(VersionRow, u64),
 }
 
 async fn revalidate_cached(
@@ -613,14 +629,17 @@ async fn revalidate_cached(
     let mut len = 0u64;
     let mut stream = resp.bytes_stream();
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk?;
+        let chunk = chunk.map_err(|source| ProxyError::UpstreamRead { source, received: len })?;
         spool.write_all(&chunk).await?;
         len += chunk.len() as u64;
     }
     spool.flush().await?;
     if let Some(want) = declared {
         if want != len {
-            return Err(ProxyError::TruncatedUpstream);
+            return Err(ProxyError::TruncatedUpstreamCapture {
+                expected: want,
+                received: len,
+            });
         }
     }
 
@@ -633,7 +652,10 @@ async fn revalidate_cached(
         content_range: None,
     };
     match commit_200(state, key, cap).await? {
-        CommitOutcome::Strong(v) => Ok(Revalidation::Changed(v)),
+        CommitOutcome::Strong(v) => Ok(Revalidation::Changed(
+            v,
+            v.total_length.expect("full representation has a length"),
+        )),
         // Upstream answered 200 without a strong validator: cannot prove
         // anything about the cached bytes; refuse to serve stale cache.
         CommitOutcome::Uncached(_) => Err(ProxyError::TruncatedUpstream),
@@ -723,9 +745,10 @@ async fn unsatisfiable(
 }
 
 enum ColdOutcome {
-    Reply(Response),
-    /// A strong 206 established a version; the caller re-plans.
-    Replan,
+    Reply(Response, u64, bool),
+    /// A strong 206 established a version; the caller re-plans. The number
+    /// is the captured response size for command-line reporting.
+    Replan(u64),
 }
 
 /// No known length yet: forward the client's Range verbatim.
@@ -737,41 +760,54 @@ async fn cold_range(
     if_range: Option<&str>,
 ) -> Result<ColdOutcome> {
     let (status, cap) = capture_upstream(state, target, range_hdr, if_range).await?;
+    let captured_len = cap.len;
     match status {
-        reqwest::StatusCode::OK => Ok(ColdOutcome::Reply(match commit_200(state, key, cap).await? {
+        reqwest::StatusCode::OK => match commit_200(state, key, cap).await? {
             CommitOutcome::Strong(v) => {
-                // Upstream ignored Range / precondition failed: the strong
-                // 200 becomes the cached current representation.
-                let body = read_checked(state, v.id, 0, v.total_length.unwrap()).await?;
-                build_response(StatusCode::OK, common_headers(&v), body)
+                let total = v.total_length.unwrap();
+                let body = read_checked(state, v.id, 0, total).await?;
+                Ok(ColdOutcome::Reply(
+                    build_response(StatusCode::OK, common_headers(&v), body),
+                    captured_len,
+                    true,
+                ))
             }
             CommitOutcome::Uncached(cap) => {
                 let body = cap.spool.read_bytes().await?;
-                build_response(StatusCode::OK, passthrough_headers(&cap), body)
+                Ok(ColdOutcome::Reply(
+                    build_response(StatusCode::OK, passthrough_headers(&cap), body),
+                    captured_len,
+                    false,
+                ))
             }
-        })),
+        },
         reqwest::StatusCode::PARTIAL_CONTENT => {
+            let captured_len = cap.len;
             match store_proven_206(state, key, None, cap, None, None).await? {
-                ProveOutcome::Stored(_) => Ok(ColdOutcome::Replan),
+                ProveOutcome::Stored(_) => Ok(ColdOutcome::Replan(captured_len)),
                 ProveOutcome::Passthrough(cap) => {
                     // Weak/no validator, bad Content-Range or multipart:
                     // pass through, never merge into the cache.
                     let body = cap.spool.read_bytes().await?;
-                    Ok(ColdOutcome::Reply(build_response(
-                        StatusCode::PARTIAL_CONTENT,
-                        passthrough_headers(&cap),
-                        body,
-                    )))
+                    Ok(ColdOutcome::Reply(
+                        build_response(
+                            StatusCode::PARTIAL_CONTENT,
+                            passthrough_headers(&cap),
+                            body,
+                        ),
+                        captured_len,
+                        false,
+                    ))
                 }
             }
         }
         reqwest::StatusCode::RANGE_NOT_SATISFIABLE => {
             let h = passthrough_headers(&cap);
-            Ok(ColdOutcome::Reply(build_response(
-                StatusCode::RANGE_NOT_SATISFIABLE,
-                h,
-                Bytes::new(),
-            )))
+            Ok(ColdOutcome::Reply(
+                build_response(StatusCode::RANGE_NOT_SATISFIABLE, h, Bytes::new()),
+                0,
+                false,
+            ))
         }
         _ => Err(ProxyError::TruncatedUpstream),
     }

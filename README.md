@@ -43,6 +43,31 @@
 
 `segments(start,end)` 为半开区间，按版本隔离并在写入时合并。
 
+## 本地预热
+
+测试开始前可使用 `warmup` 从本地清单预取已知对象区间：
+
+```bash
+UPSTREAM_BASE=http://127.0.0.1:9000/ \
+CACHE_DIR=./cache-data \
+cargo run --release --bin warmup -- --manifest ./warmup.txt
+```
+
+清单每行只能是“源表单路径 + 一个字节区间”，空行和 `#` 注释会被忽略：
+
+```text
+/obj/alpha bytes=0-999
+/obj/alpha?variant=test bytes=20000-20999
+/obj/tiny bytes=-50
+```
+
+清单不能填写 scheme/host/port，也不能使用 absolute-form URL；目标仍由启动时唯一的
+`UPSTREAM_BASE` 拼接，并复用同一套路径穿越检查、禁止重定向策略、强 ETag/`If-Range`
+证明、spool 临时文件提交和同版本区段合并。报告逐行独立记录 `hit`、`downloaded`、
+`failed`、失败原因、请求字节、命中字节、下载字节和最终校验字节；任一项失败时命令以
+非零状态退出，但不会阻止后续条目执行。重复预热已覆盖区间只做强 ETag 再验证，不重复
+下载或重复写入。
+
 ## 运行
 
 ```bash
@@ -68,11 +93,12 @@ cargo test --features test-support
 
 - 9 个库单元测试：Range 解析/边界、缺口/合并、ETag 强弱、三种 HTTP-date、
   If-Range 规则。
-- 12 个端到端集成测试：冷启动全量、重叠区段合并、suffix/开区间尾部、
+- 15 个端到端集成测试：冷启动全量、重叠区段合并、suffix/开区间尾部、
   bytes=-0 与越界 416、上游忽略 Range（200 提交）、If-Range 强/弱/陈旧、
   同长度对象换版、缓存命中 304 强校验零额外字节、上游 Content-Length 说谎、
   客户端断开取消回源且不落缓存、blob 被截断后不返回短成功响应、
-  allow-list（原始 TCP 报文测穿越/绝对形式 URL/外部重定向）。
+  allow-list（原始 TCP 报文测穿越/绝对形式 URL/外部重定向），以及本地预热的
+  不连续区间命中/幂等、非法条目隔离与 206 上游截断不提交。
 
 所有涉及字节的断言都比对实际响应体的 SHA-256 与期望切片摘要，而非仅看
 状态码或响应头。

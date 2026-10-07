@@ -12,7 +12,7 @@ pub struct RawInterval {
 }
 
 /// The parsed result of a `Range` header.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RangeSpec {
     /// One `bytes=` interval.
     Single(RawInterval),

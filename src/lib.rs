@@ -17,4 +17,7 @@ pub mod store;
 pub mod support;
 
 pub use config::ProxyConfig;
-pub use proxy::{build_app, ProxyState};
+pub use proxy::{
+    build_app, parse_warmup_manifest, summarize_with_rejections, warm_entries, WarmEntry,
+    WarmItemResult, WarmStatus, WarmSummary, ProxyState,
+};
